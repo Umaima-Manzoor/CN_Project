@@ -3,6 +3,15 @@ import ssl
 import time
 import sys
 
+def recv_exact(sock, n):
+    data = b''
+    while len(data) < n:
+        chunk = sock.recv(n - len(data))
+        if not chunk:
+            break
+        data += chunk
+    return data
+
 def main():
     mode = sys.argv[1] if len(sys.argv) > 1 else 'plaintext'
     size = int(sys.argv[2]) if len(sys.argv) > 2 else 64
@@ -36,6 +45,7 @@ def main():
 
     e2e_ms = 0.0
     e2e_overhead = 0
+    box = None
     if mode == 'e2e':
         from nacl.public import PrivateKey, Box
         from nacl.utils import random
@@ -50,8 +60,8 @@ def main():
         e2e_overhead = len(enc) - len(msg)
 
     total_handshake = tcp_ms + tls_ms + e2e_ms
-    print(f"HANDSHAKE:tcp={tcp_ms:.3f} : tls={tls_ms:.3f} : e2e={e2e_ms:.3f}  :  total={total_handshake:.3f}")
-    print(f"OVERHEAD:{e2e_overhead}")
+    print(f"HANDSHAKE:tcp={tcp_ms:.3f}:tls={tls_ms:.3f}:e2e={e2e_ms:.3f}:total={total_handshake:.3f}", flush=True)
+    print(f"OVERHEAD:{e2e_overhead}", flush=True)
 
     rtts = []
     for i in range(count):
@@ -60,20 +70,19 @@ def main():
             start = time.perf_counter()
             encrypted = box.encrypt(msg, nonce)
             sock.sendall(encrypted)
-            resp = sock.recv(65536)
+            resp = recv_exact(sock, len(encrypted))
             decrypted = box.decrypt(resp)
             end = time.perf_counter()
         else:
             start = time.perf_counter()
             sock.sendall(msg)
-            resp = sock.recv(65536)
+            resp = recv_exact(sock, size)
             end = time.perf_counter()
         rtt = (end - start) * 1000
         rtts.append(rtt)
-        print(f"RTT:{rtt:.3f}")
 
-    avg_rtt = sum(rtts) / len(rtts)
-    print(f"AVG_RTT:{avg_rtt:.3f}")
+    avg_rtt = sum(rtts) / len(rtts) if rtts else 0.0
+    print(f"AVG_RTT:{avg_rtt:.3f}", flush=True)
 
     sock.close()
 

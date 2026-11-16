@@ -9,9 +9,11 @@ RTTS = [20, 100, 200]
 REPEATS = 3
 MSG_COUNT = 1000
 
-TOPO_DIR = os.path.expanduser('~/CN_Project/topology')
-SRC_DIR = os.path.expanduser('~/CN_Project/src')
-OUT_FILE = os.path.expanduser('~/CN_Project/experiments/results.csv')
+_real_user = os.environ.get('SUDO_USER', os.environ.get('USER'))
+_HOME = os.path.expanduser(f'~{_real_user}')
+TOPO_DIR = f'{_HOME}/CN_Project/topology'
+SRC_DIR = f'{_HOME}/CN_Project/src'
+OUT_FILE = f'{_HOME}/CN_Project/experiments/results.csv'
 
 def run_cmd(cmd, timeout=120):
     result = subprocess.run(
@@ -29,8 +31,9 @@ def parse_handshake(line):
     parts = line.split(':')
     result = {}
     for part in parts[1:]:
-        key, val = part.split('=')
-        result[key] = float(val)
+        if '=' in part:
+            key, val = part.split('=')
+            result[key] = float(val)
     return result
 
 def run_one_test(mode, size, rtt, repeat):
