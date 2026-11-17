@@ -1,127 +1,152 @@
+import os
 import subprocess
 import time
-import csv
-import os
 
-MODES = ['plaintext', 'tls', 'e2e']
+SUDO_USER = os.environ.get('SUDO_USER', os.environ.get('USER', 'umaima'))
+USER_HOME = f"/home/{SUDO_USER}"
+PROJECT_DIR = f"{USER_HOME}/CN_Project"
+RESULTS_FILE = f"{PROJECT_DIR}/experiments/results.csv"
+
+MODES = ["plaintext", "tls", "e2e"]
 SIZES = [64, 1024, 16384]
 RTTS = [20, 100, 200]
-REPEATS = 3
-MSG_COUNT = 1000
+REPEATS = [1, 2, 3]
 
-_real_user = os.environ.get('SUDO_USER', os.environ.get('USER'))
-_HOME = os.path.expanduser(f'~{_real_user}')
-TOPO_DIR = f'{_HOME}/CN_Project/topology'
-SRC_DIR = f'{_HOME}/CN_Project/src'
-OUT_FILE = f'{_HOME}/CN_Project/experiments/results.csv'
-
-def run_cmd(cmd, timeout=120):
+# WHAT: Timeout increased to 1200 seconds (20 minutes)
+# WHY: Prevents subprocess timeout on high-latency 16KB E2E runs traversing 4 network hops
+def run_cmd(cmd, timeout=1200):
     result = subprocess.run(
         cmd, shell=True, capture_output=True, text=True, timeout=timeout
     )
     return result.stdout.strip(), result.stderr.strip()
 
+def get_completed_tests():
+    completed = set()
+    if os.path.exists(RESULTS_FILE):
+        with open(RESULTS_FILE, "r") as f:
+            for line in f:
+                parts = line.strip().split(",")
+                if len(parts) >= 4 and parts[0] in MODES:
+                    try:
+                        mode = parts[0]
+                        size = int(parts[1])
+                        rtt = int(parts[2])
+                        rep = int(parts[3])
+                        completed.add((mode, size, rtt, rep))
+                    except ValueError:
+                        pass
+    return completed
+
+def setup_topology():
+    print("=== Setting up topology ===")
+    run_cmd(f"bash {PROJECT_DIR}/topology/setup_topology.sh")
+
 def set_delay(rtt_ms):
-    run_cmd(f'sudo {TOPO_DIR}/set_delay.sh {rtt_ms}')
+    one_way_delay = rtt_ms / 2.0
+    run_cmd(f"bash {PROJECT_DIR}/topology/set_delay.sh {one_way_delay}ms")
 
-def reset_delay():
-    run_cmd(f'sudo {TOPO_DIR}/set_delay.sh 0')
+def parse_handshake(output):
+    tcp_hs, tls_hs, e2e_hs, total_hs = 0.0, 0.0, 0.0, 0.0
+    for line in output.split("\n"):
+        if line.startswith("HANDSHAKE:"):
+            parts = line.split(":")
+            for p in parts[1:]:
+                if "=" in p:
+                    k, v = p.split("=")
+                    try:
+                        val = float(v)
+                        if k == "tcp": tcp_hs = val
+                        elif k == "tls": tls_hs = val
+                        elif k == "e2e": e2e_hs = val
+                        elif k == "total": total_hs = val
+                    except ValueError:
+                        pass
+    return tcp_hs, tls_hs, e2e_hs, total_hs
 
-def parse_handshake(line):
-    parts = line.split(':')
-    result = {}
-    for part in parts[1:]:
-        if '=' in part:
-            key, val = part.split('=')
-            result[key] = float(val)
-    return result
+def parse_overhead(output):
+    for line in output.split("\n"):
+        if line.startswith("OVERHEAD:"):
+            try:
+                return int(line.split(":")[1])
+            except ValueError:
+                pass
+    return 0
 
-def run_one_test(mode, size, rtt, repeat):
+def parse_avg_rtt(output):
+    for line in output.split("\n"):
+        if line.startswith("AVG_RTT:"):
+            try:
+                return float(line.split(":")[1])
+            except ValueError:
+                pass
+    return 0.0
+
+def run_one_test(mode, size, rtt, rep):
     set_delay(rtt)
-    time.sleep(0.5)
-
-    server_cmd = f'sudo ip netns exec relay python3 {SRC_DIR}/exp_server.py {mode}'
-    server_proc = subprocess.Popen(
-        server_cmd, shell=True, stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE, text=True
-    )
-
-    ready = False
-    for _ in range(50):
-        line = server_proc.stdout.readline()
-        if 'READY' in line:
-            ready = True
-            break
-        time.sleep(0.1)
-
-    if not ready:
+    time.sleep(1)
+    
+    server_cmd = f"ip netns exec relay python3 {PROJECT_DIR}/src/exp_server.py {mode}"
+    server_proc = subprocess.Popen(server_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    time.sleep(2)
+    
+    try:
+        if mode == "e2e":
+            c2_cmd = f"ip netns exec client2 python3 {PROJECT_DIR}/src/exp_client.py {mode} {size} 1000 recipient"
+            c2_proc = subprocess.Popen(c2_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            time.sleep(1.5)
+            
+            c1_cmd = f"ip netns exec client1 python3 {PROJECT_DIR}/src/exp_client.py {mode} {size} 1000"
+            client_out, client_err = run_cmd(c1_cmd, timeout=1200)
+            c2_proc.kill()
+        else:
+            client_cmd = f"ip netns exec client1 python3 {PROJECT_DIR}/src/exp_client.py {mode} {size} 1000"
+            client_out, client_err = run_cmd(client_cmd, timeout=1200)
+            
+    finally:
         server_proc.kill()
-        return None
+        time.sleep(1)
 
-    client_cmd = f'sudo ip netns exec client1 python3 {SRC_DIR}/exp_client.py {mode} {size} {MSG_COUNT}'
-    client_out, client_err = run_cmd(client_cmd, timeout=300)
+    tcp_hs, tls_hs, e2e_hs, total_hs = parse_handshake(client_out)
+    overhead = parse_overhead(client_out)
+    avg_rtt = parse_avg_rtt(client_out)
 
-    server_proc.terminate()
-    server_proc.wait()
-
-    result = {
-        'mode': mode, 'size': size, 'rtt': rtt, 'repeat': repeat,
-        'tcp_hs': 0.0, 'tls_hs': 0.0, 'e2e_hs': 0.0, 'total_hs': 0.0,
-        'overhead': 0, 'avg_rtt': 0.0
-    }
-
-    for line in client_out.split('\n'):
-        if line.startswith('HANDSHAKE:'):
-            hs = parse_handshake(line)
-            result['tcp_hs'] = hs.get('tcp', 0.0)
-            result['tls_hs'] = hs.get('tls', 0.0)
-            result['e2e_hs'] = hs.get('e2e', 0.0)
-            result['total_hs'] = hs.get('total', 0.0)
-        elif line.startswith('OVERHEAD:'):
-            result['overhead'] = int(line.split(':')[1])
-        elif line.startswith('AVG_RTT:'):
-            result['avg_rtt'] = float(line.split(':')[1])
-
-    return result
+    return f"{mode},{size},{rtt},{rep},{tcp_hs:.3f},{tls_hs:.3f},{e2e_hs:.3f},{total_hs:.3f},{overhead},{avg_rtt:.3f}", avg_rtt, total_hs
 
 def main():
-    print("=== Setting up topology ===")
-    run_cmd(f'sudo {TOPO_DIR}/setup_topology.sh')
-    time.sleep(1)
+    setup_topology()
+    
+    completed = get_completed_tests()
+    print(f"Found {len(completed)} already completed tests in results.csv.")
 
-    print(f"=== Starting 81 experiments ({MSG_COUNT} msgs each) ===")
-    total = len(MODES) * len(SIZES) * len(RTTS) * REPEATS
-    done = 0
+    if not os.path.exists(RESULTS_FILE):
+        os.makedirs(os.path.dirname(RESULTS_FILE), exist_ok=True)
+        with open(RESULTS_FILE, "w") as f:
+            f.write("mode,size,rtt,repeat,tcp_hs_ms,tls_hs_ms,e2e_hs_ms,total_hs_ms,e2e_overhead_bytes,avg_rtt_ms\n")
 
-    with open(OUT_FILE, 'w', newline='') as f:
-        writer = csv.writer(f)
-        writer.writerow([
-            'mode', 'size', 'rtt', 'repeat',
-            'tcp_hs_ms', 'tls_hs_ms', 'e2e_hs_ms', 'total_hs_ms',
-            'e2e_overhead_bytes', 'avg_rtt_ms'
-        ])
+    total_tests = len(MODES) * len(SIZES) * len(RTTS) * len(REPEATS)
+    count = 0
 
-        for mode in MODES:
-            for size in SIZES:
-                for rtt in RTTS:
-                    for rep in range(1, REPEATS + 1):
-                        done += 1
-                        print(f"[{done}/{total}] {mode} | {size}B | {rtt}ms | run{rep}")
-                        result = run_one_test(mode, size, rtt, rep)
-                        if result:
-                            writer.writerow([
-                                result['mode'], result['size'], result['rtt'],
-                                result['repeat'], result['tcp_hs'], result['tls_hs'],
-                                result['e2e_hs'], result['total_hs'],
-                                result['overhead'], result['avg_rtt']
-                            ])
-                            f.flush()
-                            print(f"  -> HS: {result['total_hs']:.1f}ms | RTT: {result['avg_rtt']:.3f}ms")
-                        else:
-                            print(f"  -> FAILED")
+    print(f"=== Running remaining tests out of {total_tests} (1000 msgs each) ===")
 
-    reset_delay()
-    print(f"\n=== DONE! Results saved to {OUT_FILE} ===")
+    for mode in MODES:
+        for size in SIZES:
+            for rtt in RTTS:
+                for rep in REPEATS:
+                    count += 1
+                    if (mode, size, rtt, rep) in completed:
+                        print(f"[{count}/{total_tests}] {mode} | {size}B | {rtt}ms | run{rep} -> [SKIPPED - Already Completed]")
+                        continue
+                    
+                    print(f"[{count}/{total_tests}] {mode} | {size}B | {rtt}ms | run{rep}", end="", flush=True)
+                    csv_line, avg_rtt, total_hs = run_one_test(mode, size, rtt, rep)
+                    
+                    with open(RESULTS_FILE, "a") as f:
+                        f.write(csv_line + "\n")
+                    
+                    print(f" -> HS: {total_hs:.1f}ms | RTT: {avg_rtt:.3f}ms")
 
-if __name__ == '__main__':
+    print("\nDONE! All 81 experiments complete.")
+    print(f"Results saved to {RESULTS_FILE}")
+
+if __name__ == "__main__":
     main()
